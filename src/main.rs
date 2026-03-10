@@ -1,10 +1,196 @@
+use clap::Parser;
+use serde_json::{Map, Value, json};
 use std::fmt;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
-use clap::Parser;
+use std::ptr::{addr_of, addr_of_mut};
+
+use mysql_ibdinspect::read_sdi_info_from_disk;
 
 const PAGE_SIZE: u16 = 2 << 13;
+
+#[repr(u32)]
+#[derive(Debug, PartialEq, Eq)]
+pub enum ColumnTypes {
+    DECIMAL = 1, // This is 1 > than MYSQL_TYPE_DECIMAL
+    TINY = 2,
+    SHORT = 3,
+    LONG = 4,
+    FLOAT = 5,
+    DOUBLE = 6,
+    TypeNull = 7,
+    TIMESTAMP = 8,
+    LONGLONG = 9,
+    INT24 = 10,
+    DATE = 11,
+    TIME = 12,
+    DATETIME = 13,
+    YEAR = 14,
+    NEWDATE = 15,
+    VARCHAR = 16,
+    BIT = 17,
+    TIMESTAMP2 = 18,
+    DATETIME2 = 19,
+    TIME2 = 20,
+    NEWDECIMAL = 21,
+    ENUM = 22,
+    SET = 23,
+    TinyBlob = 24,
+    MediumBlob = 25,
+    LongBlob = 26,
+    BLOB = 27,
+    VarString = 28,
+    STRING = 29,
+    GEOMETRY = 30,
+    JSON = 31,
+    VECTOR = 32,
+}
+
+impl From<u32> for ColumnTypes {
+    fn from(value: u32) -> Self {
+        match value {
+            1 => ColumnTypes::DECIMAL,
+            2 => ColumnTypes::TINY,
+            3 => ColumnTypes::SHORT,
+            4 => ColumnTypes::LONG,
+            5 => ColumnTypes::FLOAT,
+            6 => ColumnTypes::DOUBLE,
+            7 => ColumnTypes::TypeNull,
+            8 => ColumnTypes::TIMESTAMP,
+            9 => ColumnTypes::LONGLONG,
+            10 => ColumnTypes::INT24,
+            11 => ColumnTypes::DATE,
+            12 => ColumnTypes::TIME,
+            13 => ColumnTypes::DATETIME,
+            14 => ColumnTypes::YEAR,
+            15 => ColumnTypes::NEWDATE,
+            16 => ColumnTypes::VARCHAR,
+            17 => ColumnTypes::BIT,
+            18 => ColumnTypes::TIMESTAMP2,
+            19 => ColumnTypes::DATETIME2,
+            20 => ColumnTypes::TIME2,
+            21 => ColumnTypes::NEWDECIMAL,
+            22 => ColumnTypes::ENUM,
+            23 => ColumnTypes::SET,
+            24 => ColumnTypes::TinyBlob,
+            25 => ColumnTypes::MediumBlob,
+            26 => ColumnTypes::LongBlob,
+            27 => ColumnTypes::BLOB,
+            28 => ColumnTypes::VarString,
+            29 => ColumnTypes::STRING,
+            30 => ColumnTypes::GEOMETRY,
+            31 => ColumnTypes::JSON,
+            32 => ColumnTypes::VECTOR,
+            _ => panic!("Unknown column type: {}", value),
+        }
+    }
+}
+
+pub(crate) fn get_fixed_column_size(col_type: ColumnTypes) -> u32 {
+    match col_type {
+        ColumnTypes::TINY => 1,
+        ColumnTypes::SHORT => 2,
+        ColumnTypes::LONG => 4,
+        ColumnTypes::FLOAT => 4,
+        ColumnTypes::DOUBLE => 8,
+        ColumnTypes::TypeNull => 0,
+        ColumnTypes::TIMESTAMP => 4,
+        ColumnTypes::LONGLONG => 8,
+        ColumnTypes::INT24 => 3,
+        // Recheck these
+        ColumnTypes::DATE => 3,
+        ColumnTypes::TIME => 3,
+        ColumnTypes::DATETIME => 8,
+        ColumnTypes::YEAR => 1,
+        ColumnTypes::NEWDATE => 3,
+        _ => u32::MAX, // Variable length
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug)]
+enum BinError {
+    InvalidValue(&'static str),
+    DoesNotExist,
+}
+
+static mut DD_CACHE: Option<Map<String, Value>> = None;
+static mut TABLE_MAP: Option<TableMapEventOwned> = None;
+static mut DATA_DIR: Option<String> = None;
+
+fn read_data_dir() -> Result<&'static str, BinError> {
+    unsafe {
+        let data_dir = addr_of!(DATA_DIR);
+        match (*data_dir).as_ref() {
+            Some(dir) => Ok(dir),
+            None => Err(BinError::InvalidValue("Table map uninitialized")),
+        }
+    }
+}
+
+fn set_data_dir(data_dir: String) -> Option<BinError> {
+    // let ddir = data_dir.clone().as_str();
+    unsafe {
+        *addr_of_mut!(DATA_DIR) = Some(data_dir);
+        None
+    }
+}
+
+fn read_global_dd_cache(key: &str) -> Result<&'static Value, BinError> {
+    unsafe {
+        let dd_cache = addr_of!(DD_CACHE);
+        let mut key = key.to_string();
+        key.pop();
+
+        if let Some(dd_c) = (*dd_cache).as_ref() {
+            match dd_c.get(&key) {
+                Some(val) => return Ok(val),
+                None => return Err(BinError::DoesNotExist),
+            };
+        }
+
+        return Err(BinError::InvalidValue("Data Dictionary is uninitializeddd"));
+    }
+}
+
+fn update_global_dd_cache(key: String, val: Value) -> Option<BinError> {
+    unsafe {
+        let dd_cache = addr_of_mut!(DD_CACHE);
+        let mut key = key;
+        key.pop();
+
+        match (*dd_cache).as_mut() {
+            Some(dd) => {
+                dd.insert(key, val);
+            }
+            None => {
+                let mut temp = Map::new();
+                temp.insert(key, val);
+                *addr_of_mut!(DD_CACHE) = Some(temp);
+            }
+        }
+
+        None
+    }
+}
+
+fn read_global_table_map() -> Result<TableMapEventOwned, BinError> {
+    unsafe {
+        let table_map = addr_of!(TABLE_MAP);
+        match (*table_map).as_ref() {
+            Some(tmap) => Ok(tmap.clone()),
+            None => Err(BinError::InvalidValue("Table map uninitialized")),
+        }
+    }
+}
+
+fn update_global_table_map(tmap: TableMapEventOwned) -> Option<BinError> {
+    unsafe {
+        *addr_of_mut!(TABLE_MAP) = Some(tmap);
+        None
+    }
+}
 
 /*
    Event header offsets; these point to places inside the fixed header.
@@ -85,7 +271,6 @@ fn default_path() -> String {
 }
 
 #[derive(Debug, Parser)]
-// #[command(version)]
 struct Args {
     /// Path to the binlog file (binlog.xxxxxx file)
     #[arg(short = 'b', long)]
@@ -478,7 +663,8 @@ fn event_handler(event_type: LogEventType, data: &[u8], fde: &mut FormatDescript
             KnownLogEventType::ExecuteLoadQueryEvent => {}
             KnownLogEventType::TableMapEvent => {
                 match TableMapEvent::parse_table_map_event(data, fde) {
-                    Ok(ev) => {
+                    Ok(_) => {
+                        let ev = read_global_table_map().unwrap();
                         println!("{}", ev);
                     }
                     Err(e) => {
@@ -601,6 +787,7 @@ impl fmt::Display for ParseError {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 struct TableMapEvent<'a> {
     flags: u16,
     table_id: u64,
@@ -617,7 +804,24 @@ struct TableMapEvent<'a> {
     opt_metadata: &'a [u8],
 }
 
-impl<'a> fmt::Display for TableMapEvent<'a> {
+#[derive(Debug, Clone)]
+struct TableMapEventOwned {
+    flags: u16,
+    table_id: u64,
+    dblen: u64,
+    tbllen: u64,
+    col_cnt: u64,
+    field_metadata_size: u64,
+    opt_metadata_len: usize,
+    tblname: Vec<u8>,
+    dbname: Vec<u8>,
+    col_types: Vec<u8>,
+    field_metadata: Vec<u8>,
+    null_bits: Vec<u8>,
+    opt_metadata: Vec<u8>,
+}
+
+impl fmt::Display for TableMapEventOwned {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Attempt to render UTF-8 safely
         fn fmt_bytes(bytes: &[u8]) -> String {
@@ -639,16 +843,40 @@ impl<'a> fmt::Display for TableMapEvent<'a> {
         writeln!(f, "  dblen: {},", self.dblen)?;
         writeln!(f, "  tbllen: {},", self.tbllen)?;
         writeln!(f, "  table_id: {},", self.table_id)?;
-        writeln!(f, "  database: \"{}\",", fmt_bytes(self.dbname))?;
-        writeln!(f, "  table: \"{}\",", fmt_bytes(self.tblname))?;
-        writeln!(f, "  col_types: \"{}\",", fmt_bytes(self.col_types))?;
+        writeln!(f, "  database: \"{}\",", fmt_bytes(&self.dbname))?;
+        writeln!(f, "  table: \"{}\",", fmt_bytes(&self.tblname))?;
+        writeln!(f, "  col_types: \"{}\",", fmt_bytes(&self.col_types))?;
         writeln!(f, "  column_count: {},", self.col_cnt)?;
         writeln!(f, "  field_metadata_size: {},", self.field_metadata_size)?;
-        writeln!(f, "  field_metadata: \"{}\",", fmt_bytes(self.field_metadata))?;
-        writeln!(f, "  null_bits: \"{}\",", fmt_bytes(self.null_bits))?;
-        writeln!(f, "  opt_metadata: \"{}\",", fmt_bytes(self.opt_metadata))?;
+        writeln!(
+            f,
+            "  field_metadata: \"{:?}\",",
+            &self.field_metadata // fmt_bytes(&self.field_metadata)
+        )?;
+        writeln!(f, "  null_bits: \"{}\",", fmt_bytes(&self.null_bits))?;
+        writeln!(f, "  opt_metadata: \"{}\",", fmt_bytes(&self.opt_metadata))?;
         writeln!(f, "  optional_metadata_length: {},", self.opt_metadata_len)?;
         write!(f, "}}")
+    }
+}
+
+impl<'a> From<TableMapEvent<'a>> for TableMapEventOwned {
+    fn from(e: TableMapEvent<'a>) -> Self {
+        Self {
+            flags: e.flags,
+            table_id: e.table_id,
+            dblen: e.dblen,
+            tbllen: e.tbllen,
+            col_cnt: e.col_cnt,
+            field_metadata_size: e.field_metadata_size,
+            opt_metadata_len: e.opt_metadata_len,
+            tblname: e.tblname.to_vec(),
+            dbname: e.dbname.to_vec(),
+            col_types: e.col_types.to_vec(),
+            field_metadata: e.field_metadata.to_vec(),
+            null_bits: e.null_bits.to_vec(),
+            opt_metadata: e.opt_metadata.to_vec(),
+        }
     }
 }
 
@@ -656,7 +884,7 @@ impl<'a> TableMapEvent<'a> {
     pub fn parse_table_map_event(
         data: &'a [u8],
         fde: &FormatDescriptionEvent,
-    ) -> Result<Self, ParseError> {
+    ) -> Result<(), ParseError> {
         let table_id: u64;
         let flags: u16;
         let dblen: u64;
@@ -694,13 +922,24 @@ impl<'a> TableMapEvent<'a> {
         }
 
         flags = cur.read_u16_le();
-        dblen = read_parse_packed_int(&mut cur).expect("Unable to parse database length from packed int");
-        dbname = cur.read(dblen as usize + 1);
-        tbllen =
-            read_parse_packed_int(&mut cur).expect("Unable to parse database length from packed int");
-        tblname = cur.read(tbllen as usize + 1);
+        dblen = read_parse_packed_int(&mut cur)
+            .expect("Unable to parse database length from packed int");
+        dbname = cur.read(dblen as usize);
+        // Skip null c-style terminator \0
+        cur.read(1);
+        // let mut dbname = vec![0u8; dblen as usize - 1];
+        // dbname[..].copy_from_slice(&dbname2[(dblen - 1) as usize..]);
+        tbllen = read_parse_packed_int(&mut cur)
+            .expect("Unable to parse database length from packed int");
+        tblname = cur.read(tbllen as usize);
+        // Skip null c-style terminator \0
+        cur.read(1);
+        // let mut tblname = vec![0u8; dblen as usize - 1];
+        // tblname[..].copy_from_slice(&tblname2[(tbllen - 1) as usize..]);
+        // tblname[(tbllen - 1) as usize..].copy_from_slice(&tblname[(tbllen - 1) as usize..]);
 
-        col_cnt = read_parse_packed_int(&mut cur).expect("Unable to parse column count from packed int");
+        col_cnt =
+            read_parse_packed_int(&mut cur).expect("Unable to parse column count from packed int");
         col_types = cur.read(col_cnt as usize);
 
         if cur.read_more() {
@@ -724,7 +963,7 @@ impl<'a> TableMapEvent<'a> {
             opt_metadata = cur.read(0);
         }
 
-        Ok(TableMapEvent {
+        let ev = TableMapEvent {
             flags,
             table_id,
             dblen,
@@ -738,16 +977,20 @@ impl<'a> TableMapEvent<'a> {
             null_bits,
             opt_metadata_len,
             opt_metadata,
-        })
+        };
+
+        update_global_table_map(ev.into());
+
+        Ok(())
     }
 }
 
 struct WriteRowsEvent<'a> {
-    flags: u16, /// Flags for row-level events
+    flags: u16, // Flags for row-level events
     var_header_len: u16,
-    n_bits_len: u32, /// value determined by (m_width + 7) / 8
+    n_bits_len: u32, // value determined by (m_width + 7) / 8
     table_id: u64,
-    width: u64, /// The width of the columns bitmap
+    width: u64, // The width of the columns bitmap
     columns_before_image: &'a [u8],
     columns_after_image: &'a [u8],
     row: &'a [u8],
@@ -785,7 +1028,10 @@ impl<'a> WriteRowsEvent<'a> {
         flags = cur.read_u16_le();
 
         // We expect the post-header length to be 10 bytes, and if it's not, we have an unsupported format.
-        assert_eq!(fde.post_header_len[KnownLogEventType::WriteRowsEvent as usize - 1] as u32, ROWS_HEADER_LEN_V2);
+        assert_eq!(
+            fde.post_header_len[KnownLogEventType::WriteRowsEvent as usize - 1] as u32,
+            ROWS_HEADER_LEN_V2
+        );
 
         width = read_parse_packed_int(&mut cur).expect("Unable to parse width from packed int");
         assert_ne!(width, 0, "Width must be greater than 0");
@@ -831,17 +1077,133 @@ impl<'a> fmt::Display for WriteRowsEvent<'a> {
         writeln!(f, "  n_bits_len: {},", self.n_bits_len)?;
         writeln!(f, "  table_id: {},", self.table_id)?;
         writeln!(f, "  width: {},", self.width)?;
-        writeln!(f, "  columns_before_image: \"{}\",", fmt_bytes(self.columns_before_image))?;
-        writeln!(f, "  columns_after_image: \"{}\",", fmt_bytes(self.columns_after_image))?;
-        writeln!(f, "  row: \"{}\",", String::from_utf8_lossy(self.row))?;
+        writeln!(
+            f,
+            "  columns_before_image: \"{}\",",
+            fmt_bytes(self.columns_before_image)
+        )?;
+        writeln!(
+            f,
+            "  columns_after_image: \"{}\",",
+            fmt_bytes(self.columns_after_image)
+        )?;
+
+        let table_map = read_global_table_map().unwrap();
+        let t_name = &table_map.tblname;
+        let mut columns: Vec<Value> = Vec::new();
+        let sdi_info: &Value;
+        match read_global_dd_cache(
+            String::from_utf8(t_name.to_vec())
+                .expect("Invalid UTF-8 sequence")
+                .as_str(),
+        ) {
+            Ok(dd) => sdi_info = dd,
+            Err(e) => {
+                eprintln!("Table information not found in dd cache: {:?}", e);
+                let mut file_path = PathBuf::from(read_data_dir().unwrap())
+                    .join(String::from_utf8_lossy(&table_map.dbname).as_ref())
+                    .join(String::from_utf8_lossy(&table_map.tblname).as_ref());
+                file_path.set_extension("ibd");
+
+                let buf = [0u8; PAGE_SIZE as usize];
+                let mut file = File::open(file_path).expect("Failed to open file");
+                let sdi = serde_json::to_value(read_sdi_info_from_disk(&mut file, buf)).unwrap();
+                update_global_dd_cache(
+                    String::from_utf8(t_name.to_vec()).expect("Invalid UTF-8 sequence"),
+                    sdi,
+                );
+                sdi_info = read_global_dd_cache(
+                    String::from_utf8(t_name.to_vec())
+                        .expect("Invalid UTF-8 sequence")
+                        .as_str(),
+                )
+                .unwrap();
+            }
+        }
+
+        let mut out_data: Map<String, Value> = Map::new();
+
+        // Retrieve columns from SDI data
+        for rec in sdi_info.as_array().unwrap() {
+            if let Some(Value::Object(dd_object)) = rec.get("dd_object") {
+                if let Some(obj_type) = rec.get("dd_object_type") {
+                    if obj_type == "Table" {
+                        if let Some(Value::Array(cols)) = dd_object.get("columns") {
+                            columns = cols.clone();
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        let rec_buf = &self.row[3..];
+        let mut off = 0;
+        let mut meta_i: usize = 0;
+        for i in 0..table_map.col_cnt {
+            let col: &Map<String, Value> = columns[i as usize]
+                .as_object()
+                .expect("Error parsing column information from SDI");
+            let col_name = col["name"].as_str().unwrap_or("");
+
+            let fixed_col_size = get_fixed_column_size(ColumnTypes::from(
+                col["type"].as_u64().unwrap_or(u64::MAX) as u32,
+            ));
+
+            // We are only handling fixed size columns and varchar/string type columns
+            if fixed_col_size < u32::MAX {
+                // FIX: Assumes integer only(4 bytes). Should change
+                let field = &rec_buf[off as usize..(off + fixed_col_size) as usize];
+                out_data.insert(col_name.to_string(), json!(read_from_4(field)));
+                off += fixed_col_size;
+            } else {
+                // See Field_string::unpack
+                let param_data = read_from_2(&table_map.field_metadata[meta_i..]);
+                let from_length = (((param_data >> 4) & 0x300) ^ 0x300) + (param_data & 0x00ff);
+                meta_i += 2;
+                if from_length > 255 {
+                    let len = read_from_2(&rec_buf[off as usize..]);
+                    off += 2;
+                    let field = &rec_buf[(off) as usize..(off + len as u32) as usize];
+                    out_data.insert(col_name.to_string(), json!(String::from_utf8_lossy(field)));
+                    off += len as u32;
+                } else {
+                    let len = read_from_1(&rec_buf[off as usize..]);
+                    off += 1;
+                    let field = &rec_buf[(off) as usize..(off + len as u32) as usize];
+                    out_data.insert(col_name.to_string(), json!(String::from_utf8_lossy(field)));
+                    off += len as u32;
+                }
+            }
+        }
+
+        writeln!(
+            f,
+            "  Insert: {},",
+            serde_json::to_string_pretty(&out_data).expect("Error")
+        )?;
         write!(f, "}}")
     }
 }
 
 fn main() {
-    let args = Args::parse();
+    let mut args = Args::parse();
     let buf = &mut [0u8; PAGE_SIZE as usize];
     let mut pos;
+
+    let data_dir = args
+        .data_files_dir
+        .to_str()
+        .expect("Error reading data dir");
+    if data_dir == "." || data_dir == " " {
+        eprintln!(
+            "Data directory containing table data files(<tablename>.ibd) does not exist. Defaulting to Linux path /var/lib/mysql"
+        );
+        args.data_files_dir = PathBuf::from("/var/lib/mysql");
+    }
+
+    let data_dir = String::from(args.data_files_dir.clone().to_string_lossy());
+    set_data_dir(data_dir);
 
     read_page(0, &args.binlog, buf);
 
@@ -910,5 +1272,4 @@ fn main() {
             cur.jump(pos as usize);
         }
     }
-
 }
