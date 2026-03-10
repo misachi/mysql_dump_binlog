@@ -5,6 +5,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::ptr::{addr_of, addr_of_mut};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use mysql_ibdinspect::read_sdi_info_from_disk;
 
@@ -118,6 +119,7 @@ enum BinError {
 static mut DD_CACHE: Option<Map<String, Value>> = None;
 static mut TABLE_MAP: Option<TableMapEventOwned> = None;
 static mut DATA_DIR: Option<String> = None;
+static VERBOSE: AtomicBool = AtomicBool::new(false);
 
 fn read_data_dir() -> Result<&'static str, BinError> {
     unsafe {
@@ -270,13 +272,33 @@ fn default_path() -> String {
     ".".to_string()
 }
 
+macro_rules! vbinprintln {
+    ($($arg:tt)*) => {
+        if VERBOSE.load(Ordering::Relaxed) {
+            println!($($arg)*);
+        }
+    };
+}
+
+macro_rules! vbinwriteln {
+    ($dst:expr, $($arg:tt)*) => {
+        if VERBOSE.load(Ordering::Relaxed) {
+            writeln!($dst, $($arg)*).unwrap();
+        }
+    };
+}
+
 #[derive(Debug, Parser)]
 struct Args {
     /// Path to the binlog file (binlog.xxxxxx file)
     #[arg(short = 'b', long)]
     binlog: PathBuf,
+    /// path to directory containing .ibd data files, used for parsing row events
     #[arg(short = 'd', long, default_value = default_path())]
-    data_files_dir: PathBuf, // path to directory containing .ibd data files, used for parsing row events
+    data_files_dir: PathBuf,
+    /// Level of output
+    #[arg(short, long)]
+    verbose: bool,
 }
 
 #[repr(u8)]
@@ -590,18 +612,19 @@ impl fmt::Display for FormatDescriptionEvent {
             }
         };
 
-        writeln!(f, "FormatDescriptionEvent {{")?;
-        writeln!(f, "  created: {},", self.created)?;
-        writeln!(f, "  binlog_version: {},", self.binlog_version)?;
-        writeln!(f, "  server_version: \"{}\",", server_version)?;
-        writeln!(f, "  common_header_len: {},", self.common_header_len)?;
-        writeln!(
+        vbinwriteln!(f, "FormatDescriptionEvent {{");
+        vbinwriteln!(f, "  created: {},", self.created);
+        vbinwriteln!(f, "  binlog_version: {},", self.binlog_version);
+        vbinwriteln!(f, "  server_version: \"{}\",", server_version);
+        vbinwriteln!(f, "  common_header_len: {},", self.common_header_len);
+        vbinwriteln!(
             f,
             "  number_of_event_types: {},",
             self.number_of_event_types
-        )?;
-        writeln!(f, "  post_header_len: {:?},", self.post_header_len)?;
-        write!(f, "}}")
+        );
+        vbinwriteln!(f, "  post_header_len: {:?},", self.post_header_len);
+        vbinwriteln!(f, "}}");
+        Ok(())
     }
 }
 
@@ -651,7 +674,7 @@ fn event_handler(event_type: LogEventType, data: &[u8], fde: &mut FormatDescript
             KnownLogEventType::FormatDescriptionEvent => {
                 match FormatDescriptionEvent::parse_format_description_event(data) {
                     Ok(ev) => {
-                        println!("{}", ev);
+                        vbinprintln!("{}", ev);
                     }
                     Err(e) => {
                         eprintln!("FormatDescriptionEvent parse error: {}", e)
@@ -665,7 +688,7 @@ fn event_handler(event_type: LogEventType, data: &[u8], fde: &mut FormatDescript
                 match TableMapEvent::parse_table_map_event(data, fde) {
                     Ok(_) => {
                         let ev = read_global_table_map().unwrap();
-                        println!("{}", ev);
+                        vbinprintln!("{}", ev);
                     }
                     Err(e) => {
                         eprintln!("TableMapEvent parse error: {}", e)
@@ -838,25 +861,27 @@ impl fmt::Display for TableMapEventOwned {
             }
         }
 
-        writeln!(f, "TableMapEvent {{")?;
-        writeln!(f, "  flags: {},", self.flags)?;
-        writeln!(f, "  dblen: {},", self.dblen)?;
-        writeln!(f, "  tbllen: {},", self.tbllen)?;
-        writeln!(f, "  table_id: {},", self.table_id)?;
-        writeln!(f, "  database: \"{}\",", fmt_bytes(&self.dbname))?;
-        writeln!(f, "  table: \"{}\",", fmt_bytes(&self.tblname))?;
-        writeln!(f, "  col_types: \"{}\",", fmt_bytes(&self.col_types))?;
-        writeln!(f, "  column_count: {},", self.col_cnt)?;
-        writeln!(f, "  field_metadata_size: {},", self.field_metadata_size)?;
-        writeln!(
+        vbinwriteln!(f, "TableMapEvent {{");
+        vbinwriteln!(f, "  flags: {},", self.flags);
+        vbinwriteln!(f, "  dblen: {},", self.dblen);
+        vbinwriteln!(f, "  tbllen: {},", self.tbllen);
+        vbinwriteln!(f, "  table_id: {},", self.table_id);
+        vbinwriteln!(f, "  database: \"{}\",", fmt_bytes(&self.dbname));
+        vbinwriteln!(f, "  table: \"{}\",", fmt_bytes(&self.tblname));
+        vbinwriteln!(f, "  col_types: \"{}\",", fmt_bytes(&self.col_types));
+        vbinwriteln!(f, "  column_count: {},", self.col_cnt);
+        vbinwriteln!(f, "  field_metadata_size: {},", self.field_metadata_size);
+        vbinwriteln!(
             f,
             "  field_metadata: \"{:?}\",",
             &self.field_metadata // fmt_bytes(&self.field_metadata)
-        )?;
-        writeln!(f, "  null_bits: \"{}\",", fmt_bytes(&self.null_bits))?;
-        writeln!(f, "  opt_metadata: \"{}\",", fmt_bytes(&self.opt_metadata))?;
-        writeln!(f, "  optional_metadata_length: {},", self.opt_metadata_len)?;
-        write!(f, "}}")
+        );
+        vbinwriteln!(f, "  null_bits: \"{}\",", fmt_bytes(&self.null_bits));
+        vbinwriteln!(f, "  opt_metadata: \"{}\",", fmt_bytes(&self.opt_metadata));
+        vbinwriteln!(f, "  optional_metadata_length: {},", self.opt_metadata_len);
+        vbinwriteln!(f, "}}");
+        // write!(f, "")
+        Ok(())
     }
 }
 
@@ -927,16 +952,12 @@ impl<'a> TableMapEvent<'a> {
         dbname = cur.read(dblen as usize);
         // Skip null c-style terminator \0
         cur.read(1);
-        // let mut dbname = vec![0u8; dblen as usize - 1];
-        // dbname[..].copy_from_slice(&dbname2[(dblen - 1) as usize..]);
+
         tbllen = read_parse_packed_int(&mut cur)
             .expect("Unable to parse database length from packed int");
         tblname = cur.read(tbllen as usize);
         // Skip null c-style terminator \0
         cur.read(1);
-        // let mut tblname = vec![0u8; dblen as usize - 1];
-        // tblname[..].copy_from_slice(&tblname2[(tbllen - 1) as usize..]);
-        // tblname[(tbllen - 1) as usize..].copy_from_slice(&tblname[(tbllen - 1) as usize..]);
 
         col_cnt =
             read_parse_packed_int(&mut cur).expect("Unable to parse column count from packed int");
@@ -1071,22 +1092,22 @@ impl<'a> fmt::Display for WriteRowsEvent<'a> {
             }
         }
 
-        writeln!(f, "WriteRowsEvent {{")?;
-        writeln!(f, "  flags: {},", self.flags)?;
-        writeln!(f, "  var_header_len: {},", self.var_header_len)?;
-        writeln!(f, "  n_bits_len: {},", self.n_bits_len)?;
-        writeln!(f, "  table_id: {},", self.table_id)?;
-        writeln!(f, "  width: {},", self.width)?;
-        writeln!(
+        vbinwriteln!(f, "WriteRowsEvent {{");
+        vbinwriteln!(f, "  flags: {},", self.flags);
+        vbinwriteln!(f, "  var_header_len: {},", self.var_header_len);
+        vbinwriteln!(f, "  n_bits_len: {},", self.n_bits_len);
+        vbinwriteln!(f, "  table_id: {},", self.table_id);
+        vbinwriteln!(f, "  width: {},", self.width);
+        vbinwriteln!(
             f,
             "  columns_before_image: \"{}\",",
             fmt_bytes(self.columns_before_image)
-        )?;
-        writeln!(
+        );
+        vbinwriteln!(
             f,
             "  columns_after_image: \"{}\",",
             fmt_bytes(self.columns_after_image)
-        )?;
+        );
 
         let table_map = read_global_table_map().unwrap();
         let t_name = &table_map.tblname;
@@ -1099,7 +1120,7 @@ impl<'a> fmt::Display for WriteRowsEvent<'a> {
         ) {
             Ok(dd) => sdi_info = dd,
             Err(e) => {
-                eprintln!("Table information not found in dd cache: {:?}", e);
+                vbinprintln!("Table information not found in dd cache: {:?}", e);
                 let mut file_path = PathBuf::from(read_data_dir().unwrap())
                     .join(String::from_utf8_lossy(&table_map.dbname).as_ref())
                     .join(String::from_utf8_lossy(&table_map.tblname).as_ref());
@@ -1179,10 +1200,11 @@ impl<'a> fmt::Display for WriteRowsEvent<'a> {
 
         writeln!(
             f,
-            "  Insert: {},",
+            "Insert: {},",
             serde_json::to_string_pretty(&out_data).expect("Error")
         )?;
-        write!(f, "}}")
+        vbinwriteln!(f, "}}");
+        Ok(())
     }
 }
 
@@ -1201,6 +1223,8 @@ fn main() {
         );
         args.data_files_dir = PathBuf::from("/var/lib/mysql");
     }
+
+    VERBOSE.store(args.verbose, Ordering::Relaxed);
 
     let data_dir = String::from(args.data_files_dir.clone().to_string_lossy());
     set_data_dir(data_dir);
@@ -1226,7 +1250,7 @@ fn main() {
     event_header.log_pos = read_from_4(&data_buf[LOG_POS_OFFSET as usize..]);
     pos = event_header.log_pos;
 
-    println!("Event Log Header: {:?}", event_header);
+    vbinprintln!("Event Log Header: {:?}", event_header);
     cur.jump((BINLOG_MAGIC_SIZE + LOG_EVENT_HEADER_LEN) as usize);
 
     let mut fde = match FormatDescriptionEvent::parse_format_description_event(
@@ -1237,7 +1261,7 @@ fn main() {
             panic!("FormatDescriptionEvent parse error: {}", e)
         }
     };
-    println!("{}", fde);
+    vbinprintln!("{}", fde);
     cur.jump(event_header.log_pos as usize);
 
     while pos < PAGE_SIZE as u32 {
