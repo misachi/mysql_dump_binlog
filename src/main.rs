@@ -1,113 +1,27 @@
 use clap::Parser;
+use serde_json::Value::Null;
 use serde_json::{Map, Value, json};
-use std::fmt;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
+use std::ops::Deref;
 use std::path::PathBuf;
 use std::ptr::{addr_of, addr_of_mut};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::{fmt, println, unreachable, writeln};
 
 use mysql_ibdinspect::read_sdi_info_from_disk;
 
+use binlog::data0fil::{
+    KnownLogEventType, LogEventType, get_fixed_column_size, ColumnTypes
+};
+
+use binlog::page::{
+    BINLOG_MAGIC, BINLOG_MAGIC_SIZE, EVENT_LEN_OFFSET, EVENT_TYPE_OFFSET, FLAGS_OFFSET,
+    LOG_EVENT_HEADER_LEN, LOG_POS_OFFSET, ROWS_HEADER_LEN_V2, SERVER_ID_OFFSET, ST_SERVER_VER_LEN,
+    TABLE_MAP_HEADER_LEN,
+};
+
 const PAGE_SIZE: u16 = 2 << 13;
-
-#[repr(u32)]
-#[derive(Debug, PartialEq, Eq)]
-pub enum ColumnTypes {
-    DECIMAL = 1, // This is 1 > than MYSQL_TYPE_DECIMAL
-    TINY = 2,
-    SHORT = 3,
-    LONG = 4,
-    FLOAT = 5,
-    DOUBLE = 6,
-    TypeNull = 7,
-    TIMESTAMP = 8,
-    LONGLONG = 9,
-    INT24 = 10,
-    DATE = 11,
-    TIME = 12,
-    DATETIME = 13,
-    YEAR = 14,
-    NEWDATE = 15,
-    VARCHAR = 16,
-    BIT = 17,
-    TIMESTAMP2 = 18,
-    DATETIME2 = 19,
-    TIME2 = 20,
-    NEWDECIMAL = 21,
-    ENUM = 22,
-    SET = 23,
-    TinyBlob = 24,
-    MediumBlob = 25,
-    LongBlob = 26,
-    BLOB = 27,
-    VarString = 28,
-    STRING = 29,
-    GEOMETRY = 30,
-    JSON = 31,
-    VECTOR = 32,
-}
-
-impl From<u32> for ColumnTypes {
-    fn from(value: u32) -> Self {
-        match value {
-            1 => ColumnTypes::DECIMAL,
-            2 => ColumnTypes::TINY,
-            3 => ColumnTypes::SHORT,
-            4 => ColumnTypes::LONG,
-            5 => ColumnTypes::FLOAT,
-            6 => ColumnTypes::DOUBLE,
-            7 => ColumnTypes::TypeNull,
-            8 => ColumnTypes::TIMESTAMP,
-            9 => ColumnTypes::LONGLONG,
-            10 => ColumnTypes::INT24,
-            11 => ColumnTypes::DATE,
-            12 => ColumnTypes::TIME,
-            13 => ColumnTypes::DATETIME,
-            14 => ColumnTypes::YEAR,
-            15 => ColumnTypes::NEWDATE,
-            16 => ColumnTypes::VARCHAR,
-            17 => ColumnTypes::BIT,
-            18 => ColumnTypes::TIMESTAMP2,
-            19 => ColumnTypes::DATETIME2,
-            20 => ColumnTypes::TIME2,
-            21 => ColumnTypes::NEWDECIMAL,
-            22 => ColumnTypes::ENUM,
-            23 => ColumnTypes::SET,
-            24 => ColumnTypes::TinyBlob,
-            25 => ColumnTypes::MediumBlob,
-            26 => ColumnTypes::LongBlob,
-            27 => ColumnTypes::BLOB,
-            28 => ColumnTypes::VarString,
-            29 => ColumnTypes::STRING,
-            30 => ColumnTypes::GEOMETRY,
-            31 => ColumnTypes::JSON,
-            32 => ColumnTypes::VECTOR,
-            _ => panic!("Unknown column type: {}", value),
-        }
-    }
-}
-
-pub(crate) fn get_fixed_column_size(col_type: ColumnTypes) -> u32 {
-    match col_type {
-        ColumnTypes::TINY => 1,
-        ColumnTypes::SHORT => 2,
-        ColumnTypes::LONG => 4,
-        ColumnTypes::FLOAT => 4,
-        ColumnTypes::DOUBLE => 8,
-        ColumnTypes::TypeNull => 0,
-        ColumnTypes::TIMESTAMP => 4,
-        ColumnTypes::LONGLONG => 8,
-        ColumnTypes::INT24 => 3,
-        // Recheck these
-        ColumnTypes::DATE => 3,
-        ColumnTypes::TIME => 3,
-        ColumnTypes::DATETIME => 8,
-        ColumnTypes::YEAR => 1,
-        ColumnTypes::NEWDATE => 3,
-        _ => u32::MAX, // Variable length
-    }
-}
 
 #[allow(dead_code)]
 #[derive(Debug)]
@@ -194,80 +108,6 @@ fn update_global_table_map(tmap: TableMapEventOwned) -> Option<BinError> {
     }
 }
 
-/*
-   Event header offsets; these point to places inside the fixed header.
-*/
-const EVENT_TYPE_OFFSET: u32 = 4;
-const SERVER_ID_OFFSET: u32 = 5;
-const EVENT_LEN_OFFSET: u32 = 9;
-const LOG_POS_OFFSET: u32 = 13;
-const FLAGS_OFFSET: u32 = 17;
-
-/* The length of the array server_version */
-const ST_SERVER_VER_LEN: u32 = 50;
-
-/** start event post-header (for v3 and v4) */
-// const _ST_BINLOG_VER_OFFSET: u32 = 0;
-// const ST_SERVER_VER_OFFSET: u32 = 2;
-// const ST_CREATED_OFFSET: u32 = ST_SERVER_VER_OFFSET + ST_SERVER_VER_LEN;
-// const ST_COMMON_HEADER_LEN_OFFSET: u32 = ST_CREATED_OFFSET + 4;
-
-const LOG_EVENT_HEADER_LEN: u32 = 19; /* the fixed header length */
-
-const _LOG_EVENT_TYPES: u32 = 42;
-
-/* 4 bytes which all binlogs should begin with */
-const BINLOG_MAGIC_SIZE: u32 = 4;
-const BINLOG_MAGIC: [u8; BINLOG_MAGIC_SIZE as usize] = [0xfe, 0x62, 0x69, 0x6e];
-
-// #######
-/**
-  The lengths for the fixed data part of each event.
-  This is a const that provides post-header lengths for all events.
-*/
-// where 3.23, 4.x and 5.0 agree
-const _QUERY_HEADER_MINIMAL_LEN: u32 = 4 + 4 + 1 + 2;
-
-// where 5.0 differs: 2 for length of N-bytes vars.
-const _QUERY_HEADER_LEN: u32 = _QUERY_HEADER_MINIMAL_LEN + 2;
-
-const _STOP_HEADER_LEN: u32 = 0;
-
-const _START_V3_HEADER_LEN: u32 = 2 + ST_SERVER_VER_LEN + 4;
-
-// this is FROZEN (the Rotate post-header is frozen)
-const _ROTATE_HEADER_LEN: u32 = 8;
-
-const _INTVAR_HEADER_LEN: u32 = 0;
-const _APPEND_BLOCK_HEADER_LEN: u32 = 4;
-const _DELETE_FILE_HEADER_LEN: u32 = 4;
-const _RAND_HEADER_LEN: u32 = 0;
-const _USER_VAR_HEADER_LEN: u32 = 0;
-
-const _FORMAT_DESCRIPTION_HEADER_LEN: u32 = _START_V3_HEADER_LEN + 1 + _LOG_EVENT_TYPES;
-
-const _XID_HEADER_LEN: u32 = 0;
-
-const _BEGIN_LOAD_QUERY_HEADER_LEN: u32 = _APPEND_BLOCK_HEADER_LEN;
-
-const _ROWS_HEADER_LEN_V1: u32 = 8;
-const TABLE_MAP_HEADER_LEN: u32 = 8;
-
-const _EXECUTE_LOAD_QUERY_EXTRA_HEADER_LEN: u32 = 4 + 4 + 4 + 1;
-
-const _EXECUTE_LOAD_QUERY_HEADER_LEN: u32 =
-    _QUERY_HEADER_LEN + _EXECUTE_LOAD_QUERY_EXTRA_HEADER_LEN;
-
-const _INCIDENT_HEADER_LEN: u32 = 2;
-const _HEARTBEAT_HEADER_LEN: u32 = 0;
-const _IGNORABLE_HEADER_LEN: u32 = 0;
-const ROWS_HEADER_LEN_V2: u32 = 10;
-const _TRANSACTION_CONTEXT_HEADER_LEN: u32 = 18;
-const _VIEW_CHANGE_HEADER_LEN: u32 = 52;
-const _XA_PREPARE_HEADER_LEN: u32 = 0;
-const _TRANSACTION_PAYLOAD_HEADER_LEN: u32 = 0;
-// ######
-
 fn default_path() -> String {
     ".".to_string()
 }
@@ -299,74 +139,6 @@ struct Args {
     /// Level of output
     #[arg(short, long)]
     verbose: bool,
-}
-
-#[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KnownLogEventType {
-    /// Every time you add a type, you must assign it a number explicitly.
-    UnknownEvent = 0,
-
-    /// Deprecated since MySQL 8.0.2. Placeholder only.
-    StartEventV3 = 1,
-
-    QueryEvent = 2,
-    StopEvent = 3,
-    RotateEvent = 4,
-    IntvarEvent = 5,
-
-    SlaveEvent = 7,
-
-    AppendBlockEvent = 9,
-    DeleteFileEvent = 11,
-
-    RandEvent = 13,
-    UserVarEvent = 14,
-    FormatDescriptionEvent = 15,
-    XidEvent = 16,
-    BeginLoadQueryEvent = 17,
-    ExecuteLoadQueryEvent = 18,
-
-    TableMapEvent = 19,
-
-    /// Obsolete V1 row events (5.1.16 → 5.6, rejected since 8.4.0)
-    ObsoleteWriteRowsEventV1 = 23,
-    ObsoleteUpdateRowsEventV1 = 24,
-    ObsoleteDeleteRowsEventV1 = 25,
-
-    /// Something out of the ordinary happened on the master
-    IncidentEvent = 26,
-
-    /// Heartbeat event sent by master during idle time
-    HeartbeatLogEvent = 27,
-
-    /// Ignorable data event
-    IgnorableLogEvent = 28,
-    RowsQueryLogEvent = 29,
-
-    /// Version 2 row events
-    WriteRowsEvent = 30,
-    UpdateRowsEvent = 31,
-    DeleteRowsEvent = 32,
-
-    GtidLogEvent = 33,
-    AnonymousGtidLogEvent = 34,
-    PreviousGtidsLogEvent = 35,
-    TransactionContextEvent = 36,
-    ViewChangeEvent = 37,
-
-    /// Prepared XA transaction terminal event similar to Xid
-    XaPrepareLogEvent = 38,
-
-    /// Extension of UPDATE_ROWS_EVENT allowing partial values
-    PartialUpdateRowsEvent = 39,
-
-    TransactionPayloadEvent = 40,
-    HeartbeatLogEventV2 = 41,
-    GtidTaggedLogEvent = 42,
-
-    /// End marker
-    EnumEndEvent,
 }
 
 pub struct Cursor<'a> {
@@ -431,107 +203,6 @@ impl<'a> Cursor<'a> {
     }
 }
 
-impl fmt::Display for KnownLogEventType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let name = match self {
-            KnownLogEventType::UnknownEvent => "UnknownEvent",
-            KnownLogEventType::StartEventV3 => "StartEventV3",
-            KnownLogEventType::QueryEvent => "QueryEvent",
-            KnownLogEventType::StopEvent => "StopEvent",
-            KnownLogEventType::RotateEvent => "RotateEvent",
-            KnownLogEventType::IntvarEvent => "IntvarEvent",
-            KnownLogEventType::SlaveEvent => "SlaveEvent",
-            KnownLogEventType::AppendBlockEvent => "AppendBlockEvent",
-            KnownLogEventType::DeleteFileEvent => "DeleteFileEvent",
-            KnownLogEventType::RandEvent => "RandEvent",
-            KnownLogEventType::UserVarEvent => "UserVarEvent",
-            KnownLogEventType::FormatDescriptionEvent => "FormatDescriptionEvent",
-            KnownLogEventType::XidEvent => "XidEvent",
-            KnownLogEventType::BeginLoadQueryEvent => "BeginLoadQueryEvent",
-            KnownLogEventType::ExecuteLoadQueryEvent => "ExecuteLoadQueryEvent",
-            KnownLogEventType::TableMapEvent => "TableMapEvent",
-            KnownLogEventType::ObsoleteWriteRowsEventV1 => "ObsoleteWriteRowsEventV1",
-            KnownLogEventType::ObsoleteUpdateRowsEventV1 => "ObsoleteUpdateRowsEventV1",
-            KnownLogEventType::ObsoleteDeleteRowsEventV1 => "ObsoleteDeleteRowsEventV1",
-            KnownLogEventType::IncidentEvent => "IncidentEvent",
-            KnownLogEventType::HeartbeatLogEvent => "HeartbeatLogEvent",
-            KnownLogEventType::IgnorableLogEvent => "IgnorableLogEvent",
-            KnownLogEventType::RowsQueryLogEvent => "RowsQueryLogEvent",
-            KnownLogEventType::WriteRowsEvent => "WriteRowsEvent",
-            KnownLogEventType::UpdateRowsEvent => "UpdateRowsEvent",
-            KnownLogEventType::DeleteRowsEvent => "DeleteRowsEvent",
-            KnownLogEventType::GtidLogEvent => "GtidLogEvent",
-            KnownLogEventType::AnonymousGtidLogEvent => "AnonymousGtidLogEvent",
-            KnownLogEventType::PreviousGtidsLogEvent => "PreviousGtidsLogEvent",
-            KnownLogEventType::TransactionContextEvent => "TransactionContextEvent",
-            KnownLogEventType::ViewChangeEvent => "ViewChangeEvent",
-            KnownLogEventType::XaPrepareLogEvent => "XaPrepareLogEvent",
-            KnownLogEventType::PartialUpdateRowsEvent => "PartialUpdateRowsEvent",
-            KnownLogEventType::TransactionPayloadEvent => "TransactionPayloadEvent",
-            KnownLogEventType::HeartbeatLogEventV2 => "HeartbeatLogEventV2",
-            KnownLogEventType::GtidTaggedLogEvent => "GtidTaggedLogEvent",
-            KnownLogEventType::EnumEndEvent => "EnumEndEvent",
-        };
-
-        write!(f, "{}", name)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LogEventType {
-    Known(KnownLogEventType),
-    Unknown(u8),
-}
-
-impl From<u8> for LogEventType {
-    fn from(value: u8) -> Self {
-        let known = match value {
-            0 => Some(KnownLogEventType::UnknownEvent),
-            1 => Some(KnownLogEventType::StartEventV3),
-            2 => Some(KnownLogEventType::QueryEvent),
-            3 => Some(KnownLogEventType::StopEvent),
-            4 => Some(KnownLogEventType::RotateEvent),
-            5 => Some(KnownLogEventType::IntvarEvent),
-            7 => Some(KnownLogEventType::SlaveEvent),
-            9 => Some(KnownLogEventType::AppendBlockEvent),
-            11 => Some(KnownLogEventType::DeleteFileEvent),
-            13 => Some(KnownLogEventType::RandEvent),
-            14 => Some(KnownLogEventType::UserVarEvent),
-            15 => Some(KnownLogEventType::FormatDescriptionEvent),
-            16 => Some(KnownLogEventType::XidEvent),
-            17 => Some(KnownLogEventType::BeginLoadQueryEvent),
-            18 => Some(KnownLogEventType::ExecuteLoadQueryEvent),
-            19 => Some(KnownLogEventType::TableMapEvent),
-            23 => Some(KnownLogEventType::ObsoleteWriteRowsEventV1),
-            24 => Some(KnownLogEventType::ObsoleteUpdateRowsEventV1),
-            25 => Some(KnownLogEventType::ObsoleteDeleteRowsEventV1),
-            26 => Some(KnownLogEventType::IncidentEvent),
-            27 => Some(KnownLogEventType::HeartbeatLogEvent),
-            28 => Some(KnownLogEventType::IgnorableLogEvent),
-            29 => Some(KnownLogEventType::RowsQueryLogEvent),
-            30 => Some(KnownLogEventType::WriteRowsEvent),
-            31 => Some(KnownLogEventType::UpdateRowsEvent),
-            32 => Some(KnownLogEventType::DeleteRowsEvent),
-            33 => Some(KnownLogEventType::GtidLogEvent),
-            34 => Some(KnownLogEventType::AnonymousGtidLogEvent),
-            35 => Some(KnownLogEventType::PreviousGtidsLogEvent),
-            36 => Some(KnownLogEventType::TransactionContextEvent),
-            37 => Some(KnownLogEventType::ViewChangeEvent),
-            38 => Some(KnownLogEventType::XaPrepareLogEvent),
-            39 => Some(KnownLogEventType::PartialUpdateRowsEvent),
-            40 => Some(KnownLogEventType::TransactionPayloadEvent),
-            41 => Some(KnownLogEventType::HeartbeatLogEventV2),
-            42 => Some(KnownLogEventType::GtidTaggedLogEvent),
-            _ => None,
-        };
-
-        match known {
-            Some(k) => LogEventType::Known(k),
-            None => LogEventType::Unknown(value),
-        }
-    }
-}
-
 pub fn read_from_1(buf: &[u8]) -> u8 {
     let temp: [u8; 1] = buf[..1]
         .try_into()
@@ -544,6 +215,13 @@ pub fn read_from_2(buf: &[u8]) -> u16 {
         .try_into()
         .expect("Unable to coarse to 2 bytes array");
     u16::from_le_bytes(temp)
+}
+
+pub fn read_from_3(buf: &[u8]) -> u32 {
+    let temp: [u8; 4] = buf[..4]
+        .try_into()
+        .expect("Unable to coarse to 4 bytes array");
+    u32::from_le_bytes(temp) & 0x00FFFFFF
 }
 
 pub fn read_from_4(buf: &[u8]) -> u32 {
@@ -560,17 +238,53 @@ pub fn read_from_8(buf: &[u8]) -> u64 {
     u64::from_le_bytes(temp)
 }
 
-fn read_page(page_number: u32, file_path: &PathBuf, buf: &mut [u8]) {
+fn read_page(page_number: u32, file_path: &PathBuf, buf: &mut [u8]) -> usize {
     let mut file = File::open(file_path).expect("Failed to open file");
 
     file.seek(SeekFrom::Start(PAGE_SIZE as u64 * page_number as u64))
         .expect("Failed to seek to start");
 
-    file.read_exact(buf).expect("Unable to read file block");
+    file.read(buf).expect("Unable to read file block")
+}
+
+fn get_blob_length(in_buf: &[u8], packlength_arg: u32) -> u32 {
+    let length = match packlength_arg {
+        1 => in_buf[0] as u32,
+        2 => read_from_2(in_buf) as u32,
+        3 => read_from_3(in_buf),
+        4 => read_from_4(in_buf),
+        _ => panic!("Invalid packlength_arg value"),
+    };
+    length
+}
+
+pub fn unpack_blob(in_buf: &[u8], out_buf: &mut Vec<u8>, param_data: u32) -> u32 {
+    // Field_blob::unpack
+    let master_packlength = if param_data > 0 { param_data & 0xFF } else { 0 };
+    let blob_length = get_blob_length(in_buf, master_packlength);
+    out_buf.extend_from_slice(
+        &in_buf[master_packlength as usize..(master_packlength + blob_length) as usize],
+    );
+    return master_packlength + blob_length;
+}
+
+// Attempt to render UTF-8 safely
+fn fmt_bytes(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => s.to_string(),
+        Err(_) => {
+            // fallback to hex representation
+            bytes
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect::<Vec<_>>()
+                .join("")
+        }
+    }
 }
 
 #[derive(Default, Debug)]
-struct LogEventHeader {
+pub struct LogEventHeader {
     type_code: u8,
     flags: u16,
     when: u32,
@@ -579,10 +293,14 @@ struct LogEventHeader {
     log_pos: u32,
 }
 
-impl LogEventHeader {}
+impl LogEventHeader {
+    pub fn get_type_code(&self) -> u8 {
+        self.type_code
+    }
+}
 
 #[derive(Debug)]
-struct FormatDescriptionEvent {
+pub struct FormatDescriptionEvent {
     created: u32,
     binlog_version: u16,
     server_version: [u8; ST_SERVER_VER_LEN as usize],
@@ -657,7 +375,12 @@ impl Default for FormatDescriptionEvent {
     }
 }
 
-fn event_handler(event_type: LogEventType, data: &[u8], fde: &mut FormatDescriptionEvent) {
+fn event_handler(
+    event_type: LogEventType,
+    data: &[u8],
+    fde: &mut FormatDescriptionEvent,
+    event_header: &LogEventHeader,
+) {
     match event_type {
         LogEventType::Known(event) => match event {
             KnownLogEventType::UnknownEvent => {}
@@ -703,7 +426,7 @@ fn event_handler(event_type: LogEventType, data: &[u8], fde: &mut FormatDescript
             KnownLogEventType::IgnorableLogEvent => {}
             KnownLogEventType::RowsQueryLogEvent => {}
             KnownLogEventType::WriteRowsEvent => {
-                match WriteRowsEvent::parse_write_rows_event(data, fde) {
+                match WriteRowsEvent::new(data, fde, event_header) {
                     Ok(ev) => {
                         println!("{}", ev);
                     }
@@ -712,8 +435,26 @@ fn event_handler(event_type: LogEventType, data: &[u8], fde: &mut FormatDescript
                     }
                 }
             }
-            KnownLogEventType::UpdateRowsEvent => {}
-            KnownLogEventType::DeleteRowsEvent => {}
+            KnownLogEventType::UpdateRowsEvent => {
+                match UpdateRowsEvent::new(data, fde, event_header) {
+                    Ok(ev) => {
+                        println!("{}", ev);
+                    }
+                    Err(e) => {
+                        eprintln!("UpdateRowsEvent parse error: {}", e)
+                    }
+                }
+            }
+            KnownLogEventType::DeleteRowsEvent => {
+                match DeleteRowsEvent::new(data, fde, event_header) {
+                    Ok(ev) => {
+                        println!("{}", ev);
+                    }
+                    Err(e) => {
+                        eprintln!("DeleteRowsEvent parse error: {}", e)
+                    }
+                }
+            }
             KnownLogEventType::GtidLogEvent => {}
             KnownLogEventType::AnonymousGtidLogEvent => {}
             KnownLogEventType::PreviousGtidsLogEvent => {}
@@ -1006,7 +747,8 @@ impl<'a> TableMapEvent<'a> {
     }
 }
 
-struct WriteRowsEvent<'a> {
+#[derive(Debug, Clone)]
+struct RowsEvent<'a> {
     flags: u16, // Flags for row-level events
     var_header_len: u16,
     n_bits_len: u32, // value determined by (m_width + 7) / 8
@@ -1017,10 +759,11 @@ struct WriteRowsEvent<'a> {
     row: &'a [u8],
 }
 
-impl<'a> WriteRowsEvent<'a> {
-    pub fn parse_write_rows_event(
+impl<'a> RowsEvent<'a> {
+    pub fn parse_rows_event(
         data: &'a [u8],
         fde: &FormatDescriptionEvent,
+        event_header: &LogEventHeader,
     ) -> Result<Self, ParseError> {
         let table_id: u64;
         let flags: u16;
@@ -1030,10 +773,11 @@ impl<'a> WriteRowsEvent<'a> {
         let columns_after_image: &[u8];
         let row: &[u8];
         let var_header_len: u16 = 0; // Placeholder, as it's not explicitly used in parsing but is part of the event structure
+        let post_header_len = fde.post_header_len[KnownLogEventType::WriteRowsEvent as usize - 1];
 
         // Get a cursor to move within the buffer
         let mut cur = Cursor::new(data);
-        if fde.post_header_len[KnownLogEventType::WriteRowsEvent as usize - 1] == 6 {
+        if post_header_len == 6 {
             /* Master is of an intermediate source tree before 5.1.4. Id is 4 bytes */
             table_id = read_from_4(cur.read(4)) as u64;
         } else {
@@ -1046,23 +790,46 @@ impl<'a> WriteRowsEvent<'a> {
                 | (buf[4] as u64) << 32
                 | (buf[5] as u64) << 40;
         }
+        let table_map = read_global_table_map().unwrap();
+        assert!(
+            table_map.table_id == table_id,
+            "Table ID mismatch between WriteRowsEvent and TableMapEvent"
+        );
         flags = cur.read_u16_le();
 
+        // Post-header length for V2 events is 10
+        if post_header_len as u32 == ROWS_HEADER_LEN_V2 {
+            let extra_data_len = cur.read_u16_le() as usize; // Reads bytes 8..10 (value 2)
+
+            // Only advance if there are extra bytes beyond the length prefix itself
+            if extra_data_len > 2 {
+                cur.read(extra_data_len - 2);
+            }
+        }
+
         // We expect the post-header length to be 10 bytes, and if it's not, we have an unsupported format.
-        assert_eq!(
-            fde.post_header_len[KnownLogEventType::WriteRowsEvent as usize - 1] as u32,
-            ROWS_HEADER_LEN_V2
-        );
+        assert_eq!(post_header_len as u32, ROWS_HEADER_LEN_V2);
 
         width = read_parse_packed_int(&mut cur).expect("Unable to parse width from packed int");
+        assert!(
+            table_map.col_cnt == width,
+            "Column count mismatch between RowsEvent and TableMapEvent"
+        );
         assert_ne!(width, 0, "Width must be greater than 0");
 
         n_bits_len = (width + 7) as u32 / 8;
         columns_before_image = cur.read(n_bits_len as usize);
 
-        columns_after_image = columns_before_image.as_ref();
+        // UpdateRowsEvent and PartialUpdateRowsEvent
+        if event_header.get_type_code() == 31 || event_header.get_type_code() == 39 {
+            columns_after_image = cur.read(n_bits_len as usize);
+        } else {
+            columns_after_image = columns_before_image.as_ref();
+        }
+
         row = cur.read(cur.num_unread());
-        Ok(WriteRowsEvent {
+
+        Ok(RowsEvent {
             flags,
             var_header_len,
             n_bits_len,
@@ -1073,44 +840,14 @@ impl<'a> WriteRowsEvent<'a> {
             row,
         })
     }
-}
 
-impl<'a> fmt::Display for WriteRowsEvent<'a> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Attempt to render UTF-8 safely
-        fn fmt_bytes(bytes: &[u8]) -> String {
-            match std::str::from_utf8(bytes) {
-                Ok(s) => s.to_string(),
-                Err(_) => {
-                    // fallback to hex representation
-                    bytes
-                        .iter()
-                        .map(|b| format!("{:02x}", b))
-                        .collect::<Vec<_>>()
-                        .join("")
-                }
-            }
-        }
-
-        vbinwriteln!(f, "WriteRowsEvent {{");
-        vbinwriteln!(f, "  flags: {},", self.flags);
-        vbinwriteln!(f, "  var_header_len: {},", self.var_header_len);
-        vbinwriteln!(f, "  n_bits_len: {},", self.n_bits_len);
-        vbinwriteln!(f, "  table_id: {},", self.table_id);
-        vbinwriteln!(f, "  width: {},", self.width);
-        vbinwriteln!(
-            f,
-            "  columns_before_image: \"{}\",",
-            fmt_bytes(self.columns_before_image)
-        );
-        vbinwriteln!(
-            f,
-            "  columns_after_image: \"{}\",",
-            fmt_bytes(self.columns_after_image)
-        );
-
-        let table_map = read_global_table_map().unwrap();
+    fn table_columns(&self, table_map: &TableMapEventOwned) -> Option<Vec<Value>> {
+        // let table_map = read_global_table_map().unwrap();
         let t_name = &table_map.tblname;
+        vbinprintln!(
+            "Reading SDI information from table data file: {:?}",
+            String::from_utf8_lossy(t_name)
+        );
         let mut columns: Vec<Value> = Vec::new();
         let sdi_info: &Value;
         match read_global_dd_cache(
@@ -1142,8 +879,6 @@ impl<'a> fmt::Display for WriteRowsEvent<'a> {
             }
         }
 
-        let mut out_data: Map<String, Value> = Map::new();
-
         // Retrieve columns from SDI data
         for rec in sdi_info.as_array().unwrap() {
             if let Some(Value::Object(dd_object)) = rec.get("dd_object") {
@@ -1157,53 +892,283 @@ impl<'a> fmt::Display for WriteRowsEvent<'a> {
                 }
             }
         }
+        Some(columns)
+    }
 
-        let rec_buf = &self.row[3..];
-        let mut off = 0;
-        let mut meta_i: usize = 0;
+    fn handle_field_types(&self, off: &mut u32, meta_i: &mut usize) -> Map<String, Value> {
+        let table_map = read_global_table_map().unwrap();
+        let columns: Vec<Value> = self
+            .table_columns(&table_map)
+            .expect("Missing columns info");
+        let null_bit_mask = &self.row[*off as usize..(*off + self.n_bits_len) as usize];
+        *off += self.n_bits_len;
+
+        let mut out_data: Map<String, Value> = Map::new();
         for i in 0..table_map.col_cnt {
+            let byte_idx = i / 8;
+            let bit_idx = i % 8;
+
             let col: &Map<String, Value> = columns[i as usize]
                 .as_object()
                 .expect("Error parsing column information from SDI");
-            let col_name = col["name"].as_str().unwrap_or("");
 
             let fixed_col_size = get_fixed_column_size(ColumnTypes::from(
                 col["type"].as_u64().unwrap_or(u64::MAX) as u32,
             ));
 
+            assert!(
+                self.row[*off as usize..].len() as u32 > 0,
+                "Record buffer is empty"
+            );
+
+            if (null_bit_mask[byte_idx as usize] & (1 << bit_idx)) != 0 {
+                out_data.insert(
+                    col["name"].as_str().unwrap_or("unknown").to_string(),
+                    json!(Null),
+                );
+                continue;
+            }
+
             // We are only handling fixed size columns and varchar/string type columns
             if fixed_col_size < u32::MAX {
                 // FIX: Assumes integer only(4 bytes). Should change
-                let field = &rec_buf[off as usize..(off + fixed_col_size) as usize];
-                out_data.insert(col_name.to_string(), json!(read_from_4(field)));
-                off += fixed_col_size;
+                let field = &&self.row[*off as usize..(*off + fixed_col_size) as usize];
+                out_data.insert(
+                    col["name"].as_str().unwrap_or("unknown").to_string(),
+                    json!(read_from_4(field)),
+                );
+                *off += fixed_col_size;
             } else {
-                // See Field_string::unpack
-                let param_data = read_from_2(&table_map.field_metadata[meta_i..]);
-                let from_length = (((param_data >> 4) & 0x300) ^ 0x300) + (param_data & 0x00ff);
-                meta_i += 2;
-                if from_length > 255 {
-                    let len = read_from_2(&rec_buf[off as usize..]);
-                    off += 2;
-                    let field = &rec_buf[(off) as usize..(off + len as u32) as usize];
-                    out_data.insert(col_name.to_string(), json!(String::from_utf8_lossy(field)));
-                    off += len as u32;
-                } else {
-                    let len = read_from_1(&rec_buf[off as usize..]);
-                    off += 1;
-                    let field = &rec_buf[(off) as usize..(off + len as u32) as usize];
-                    out_data.insert(col_name.to_string(), json!(String::from_utf8_lossy(field)));
-                    off += len as u32;
+                let column = ColumnTypes::from(col["type"].as_u64().unwrap_or(u64::MAX) as u32);
+                match column {
+                    ColumnTypes::BLOB => {
+                        // See Field_blob::unpack
+                        // Pack length is stored in a single byte. See mysql Table_map_event
+                        let param_data = read_from_1(&table_map.field_metadata[*meta_i..]);
+                        *meta_i += 1;
+                        let in_buf = &&self.row[*off as usize..];
+                        let mut out_buf = Vec::new();
+                        let length = unpack_blob(in_buf, &mut out_buf, param_data as u32);
+                        out_data.insert(
+                            col["name"].as_str().unwrap_or("unknown").to_string(),
+                            json!(String::from_utf8_lossy(&out_buf)),
+                        );
+                        *off += length;
+                    }
+                    ColumnTypes::VARCHAR | ColumnTypes::STRING => {
+                        // See Field_string::unpack
+                        // Pack length is stored in a two bytes. See mysql Table_map_event
+                        let param_data = read_from_2(&table_map.field_metadata[*meta_i..]);
+                        let from_length =
+                            (((param_data >> 4) & 0x300) ^ 0x300) + (param_data & 0x00ff);
+                        *meta_i += 2;
+                        if from_length > 255 {
+                            let len = read_from_2(&&self.row[*off as usize..]);
+                            *off += 2;
+                            let field = &&self.row[(*off) as usize..(*off + len as u32) as usize];
+                            out_data.insert(
+                                col["name"].as_str().unwrap_or("unknown").to_string(),
+                                json!(String::from_utf8_lossy(field)),
+                            );
+                            *off += len as u32;
+                        } else {
+                            let len = read_from_1(&&self.row[*off as usize..]);
+                            *off += 1;
+                            let field = &&self.row[(*off) as usize..(*off + len as u32) as usize];
+                            out_data.insert(
+                                col["name"].as_str().unwrap_or("unknown").to_string(),
+                                json!(String::from_utf8_lossy(field)),
+                            );
+                            *off += len as u32;
+                        }
+                    }
+                    _ => {
+                        panic!("Unsupported column type: {:?}", column);
+                    }
                 }
             }
         }
+        out_data
+    }
+
+    fn to_json(&self) -> Map<String, Value> {
+        let mut ret_data = Map::new();
+        if VERBOSE.load(Ordering::Relaxed) {
+            ret_data.insert("flags".to_string(), Value::Number(self.flags.into()));
+            ret_data.insert(
+                "var_header_len".to_string(),
+                Value::Number(self.var_header_len.into()),
+            );
+            ret_data.insert(
+                "n_bits_len".to_string(),
+                Value::Number(self.n_bits_len.into()),
+            );
+            ret_data.insert("table_id".to_string(), Value::Number(self.table_id.into()));
+            ret_data.insert("width".to_string(), Value::Number(self.width.into()));
+            ret_data.insert(
+                "columns_before_image".to_string(),
+                Value::String(fmt_bytes(self.columns_before_image)),
+            );
+            ret_data.insert(
+                "columns_after_image".to_string(),
+                Value::String(fmt_bytes(self.columns_after_image)),
+            );
+        }
+
+        ret_data
+    }
+}
+
+struct WriteRowsEvent<'a> {
+    rows_event: RowsEvent<'a>,
+}
+
+impl<'a> Deref for WriteRowsEvent<'a> {
+    type Target = RowsEvent<'a>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.rows_event
+    }
+}
+
+impl<'a> WriteRowsEvent<'a> {
+    pub fn new(
+        data: &'a [u8],
+        fde: &FormatDescriptionEvent,
+        event_header: &LogEventHeader,
+    ) -> Result<Self, ParseError> {
+        let rows_event = RowsEvent::parse_rows_event(data, fde, event_header)?;
+        Ok(WriteRowsEvent { rows_event })
+    }
+
+    fn parse_fields(&self) -> Map<String, Value> {
+        // Offset through the row data
+        let mut off = 0;
+        // Offset through the table metadata
+        let mut meta_i: usize = 0;
+        self.handle_field_types(&mut off, &mut meta_i)
+    }
+}
+
+impl<'a> fmt::Display for WriteRowsEvent<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut ret_data = self.to_json();
+
+        let out_data = self.parse_fields();
+        ret_data.insert("row".to_string(), Value::Object(out_data));
 
         writeln!(
             f,
-            "Insert: {},",
-            serde_json::to_string_pretty(&out_data).expect("Error")
+            "WriteRowsEvent: {}",
+            serde_json::to_string_pretty(&ret_data).expect("Error")
         )?;
-        vbinwriteln!(f, "}}");
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct UpdateRowsEvent<'a> {
+    rows_event: RowsEvent<'a>,
+}
+
+impl<'a> Deref for UpdateRowsEvent<'a> {
+    type Target = RowsEvent<'a>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.rows_event
+    }
+}
+
+impl<'a> UpdateRowsEvent<'a> {
+    pub fn new(
+        data: &'a [u8],
+        fde: &FormatDescriptionEvent,
+        event_header: &LogEventHeader,
+    ) -> Result<Self, ParseError> {
+        let rows_event = RowsEvent::parse_rows_event(data, fde, event_header)?;
+        Ok(UpdateRowsEvent { rows_event })
+    }
+
+    fn parse_fields(&self) -> Map<String, Value> {
+        // Offset through the row data
+        let mut off = 0;
+        // Offset through the table metadata
+        let mut meta_i: usize = 0;
+        let mut out_data: Map<String, Value> = Map::new();
+        let names = ["before_image", "after_image"];
+        // Loop twice to capture before and after images
+        for k in 0..2 {
+            let row_data = self.handle_field_types(&mut off, &mut meta_i);
+
+            out_data.insert(names[k as usize].to_string(), Value::Object(row_data));
+            meta_i = 0; // Reset meta index for the next image
+        }
+        out_data
+    }
+}
+
+impl<'a> fmt::Display for UpdateRowsEvent<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut ret_data = self.to_json();
+
+        let out_data = self.parse_fields();
+        ret_data.insert("row".to_string(), Value::Object(out_data));
+
+        writeln!(
+            f,
+            "UpdateRowsEvent: {}",
+            serde_json::to_string_pretty(&ret_data).expect("Error")
+        )?;
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DeleteRowsEvent<'a> {
+    rows_event: RowsEvent<'a>,
+}
+
+impl<'a> Deref for DeleteRowsEvent<'a> {
+    type Target = RowsEvent<'a>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.rows_event
+    }
+}
+
+impl<'a> DeleteRowsEvent<'a> {
+    pub fn new(
+        data: &'a [u8],
+        fde: &FormatDescriptionEvent,
+        event_header: &LogEventHeader,
+    ) -> Result<Self, ParseError> {
+        let rows_event = RowsEvent::parse_rows_event(data, fde, event_header)?;
+        Ok(DeleteRowsEvent { rows_event })
+    }
+
+    fn parse_fields(&self) -> Map<String, Value> {
+        // Offset through the row data
+        let mut off = 0;
+        // Offset through the table metadata
+        let mut meta_i: usize = 0;
+        self.handle_field_types(&mut off, &mut meta_i)
+    }
+}
+
+impl<'a> fmt::Display for DeleteRowsEvent<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut ret_data = self.to_json();
+
+        let out_data = self.parse_fields();
+        ret_data.insert("row".to_string(), Value::Object(out_data));
+
+        writeln!(
+            f,
+            "DeleteRowsEvent: {}",
+            serde_json::to_string_pretty(&ret_data).expect("Error")
+        )?;
         Ok(())
     }
 }
@@ -1229,7 +1194,7 @@ fn main() {
     let data_dir = String::from(args.data_files_dir.clone().to_string_lossy());
     set_data_dir(data_dir);
 
-    read_page(0, &args.binlog, buf);
+    let nr = read_page(0, &args.binlog, buf);
 
     let mut event_header = LogEventHeader::default();
 
@@ -1258,22 +1223,15 @@ fn main() {
     ) {
         Ok(fde_) => fde_,
         Err(e) => {
-            panic!("FormatDescriptionEvent parse error: {}", e)
+            panic!("FormatDescriptionEvent parse error: {}", e);
         }
     };
     vbinprintln!("{}", fde);
     cur.jump(event_header.log_pos as usize);
 
-    while pos < PAGE_SIZE as u32 {
+    while pos < nr as u32 {
         let data_buf = cur.read(LOG_EVENT_HEADER_LEN as usize);
-        event_header.type_code = read_from_1(&data_buf[EVENT_TYPE_OFFSET as usize..]);
-
-        event_header.flags = read_from_2(&data_buf[FLAGS_OFFSET as usize..]);
-        event_header.when = read_from_4(data_buf);
-        event_header.unmasked_server_id = read_from_4(&data_buf[SERVER_ID_OFFSET as usize..]);
-        event_header.data_written = read_from_4(&data_buf[EVENT_LEN_OFFSET as usize..]);
-        event_header.log_pos = read_from_4(&data_buf[LOG_POS_OFFSET as usize..]);
-
+        build_event_header(&mut event_header, data_buf);
         let event =
             LogEventType::try_from(event_header.type_code).expect("Error parsing raw event type");
 
@@ -1282,12 +1240,14 @@ fn main() {
                 event,
                 &buf[(pos + LOG_EVENT_HEADER_LEN) as usize..event_header.log_pos as usize],
                 &mut fde,
+                &event_header,
             );
         } else {
             event_handler(
                 event,
                 &buf[(pos + LOG_EVENT_HEADER_LEN) as usize..],
                 &mut fde,
+                &event_header,
             );
         }
         pos = event_header.log_pos;
@@ -1296,4 +1256,14 @@ fn main() {
             cur.jump(pos as usize);
         }
     }
+}
+
+pub fn build_event_header(event_header: &mut LogEventHeader, data_buf: &[u8]) {
+    event_header.type_code = read_from_1(&data_buf[EVENT_TYPE_OFFSET as usize..]);
+
+    event_header.flags = read_from_2(&data_buf[FLAGS_OFFSET as usize..]);
+    event_header.when = read_from_4(data_buf);
+    event_header.unmasked_server_id = read_from_4(&data_buf[SERVER_ID_OFFSET as usize..]);
+    event_header.data_written = read_from_4(&data_buf[EVENT_LEN_OFFSET as usize..]);
+    event_header.log_pos = read_from_4(&data_buf[LOG_POS_OFFSET as usize..]);
 }
