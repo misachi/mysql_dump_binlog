@@ -862,6 +862,7 @@ impl<'a> RowsEvent<'a> {
                     .join(String::from_utf8_lossy(&table_map.dbname).as_ref())
                     .join(String::from_utf8_lossy(&table_map.tblname).as_ref());
                 file_path.set_extension("ibd");
+                vbinprintln!("Reading SDI information from table data file: {:?}", file_path);
 
                 let buf = [0u8; PAGE_SIZE as usize];
                 let mut file = File::open(file_path).expect("Failed to open file");
@@ -1192,6 +1193,7 @@ fn main() {
     VERBOSE.store(args.verbose, Ordering::Relaxed);
 
     let data_dir = String::from(args.data_files_dir.clone().to_string_lossy());
+    vbinprintln!("Data directory: {}", data_dir);
     set_data_dir(data_dir);
 
     let nr = read_page(0, &args.binlog, buf);
